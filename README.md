@@ -1,0 +1,207 @@
+import streamlit as st
+import pandas as pd
+import sqlite3
+from hashlib import sha256
+import json
+import os
+from datetime import datetime
+import gspread
+from google.oauth2.service_account import Credentials
+
+# ---------- CONFIG ----------
+DATA_DIR = "data"
+DB_PATH = os.path.join(DATA_DIR, "pronampe.db")
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
+
+# ---------- DATABASE ----------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    # Usuários
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            password_hash TEXT
+        )
+    """)
+    # Simulações
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS simulations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            timestamp TEXT,
+            data_json TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def create_user(username, password):
+    password_hash = sha256(password.encode()).hexdigest()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, password_hash))
+    conn.commit()
+    conn.close()
+
+def authenticate(username, password):
+    password_hash = sha256(password.encode()).hexdigest()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id FROM users WHERE username=? AND password_hash=?", (username, password_hash))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def save_simulation(user_id, data_dict):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO simulations (user_id, timestamp, data_json) VALUES (?, datetime('now'), ?)",
+              (user_id, json.dumps(data_dict)))
+    conn.commit()
+    conn.close()
+
+def get_user_simulations(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, timestamp, data_json FROM simulations WHERE user_id=? ORDER BY timestamp DESC", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    simulations = []
+    for row in rows:
+        data = json.loads(row[2])
+        simulations.append({"id": row[0], "timestamp": row[1], **data})
+    return simulations
+
+# ---------- SIMULATOR FUNCTIONS ----------
+def calculate_pronampe(loan_amount, annual_rate, months, iof_pct=0.0038, tarifas=0, margem_risco=0, selic=0):
+    """
+    Calcula parcelas Price + SAC simplificado com IOF, tarifas, margem e SELIC
+    """
+    taxa_mensal = annual_rate / 12 / 100
+    selic_mensal = selic / 12 / 100
+    taxa_efetiva = taxa_mensal + margem_risco/100 + selic_mensal
+    
+    # Price
+    price_parcela = (loan_amount * taxa_efetiva) / (1 - (1 + taxa_efetiva) ** -months)
+    
+    # IOF
+    iof_amount = loan_amount * iof_pct
+    
+    # Total parcelas
+    total_parcelas = price_parcela * months + iof_amount + tarifas
+    
+    return {
+        "parcela_mensal": round(price_parcela,2),
+        "total_parcelas": round(total_parcelas,2),
+        "iof": round(iof_amount,2),
+        "taxa_efetiva": round(taxa_efetiva*100,4)
+    }
+
+# ---------- GOOGLE SHEETS ----------
+def export_to_gsheets(sim_data, credentials_json):
+    creds_dict = json.loads(credentials_json)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client = gspread.authorize(creds)
+    
+    sheet_name = f"PRONAMPE_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    sh = client.create(sheet_name)
+    ws = sh.sheet1
+    df = pd.DataFrame([sim_data])
+    ws.update([df.columns.values.tolist()] + df.values.tolist())
+    return sheet_name
+
+# ---------- UI ----------
+st.set_page_config(page_title="Simulador PRONAMPE SaaS", layout="wide")
+st.title("📊 Simulador PRONAMPE SaaS")
+
+init_db()
+
+# Sidebar Login/Register
+st.sidebar.header("🔐 Login / Registro")
+mode = st.sidebar.radio("Escolha:", ["Login", "Registro"])
+
+if mode == "Registro":
+    new_user = st.sidebar.text_input("Novo usuário")
+    new_pass = st.sidebar.text_input("Senha", type="password")
+    if st.sidebar.button("Criar conta"):
+        try:
+            create_user(new_user, new_pass)
+            st.success("Usuário criado! Faça login.")
+        except:
+            st.error("Usuário já existe.")
+else:
+    username = st.sidebar.text_input("Usuário")
+    password = st.sidebar.text_input("Senha", type="password")
+    if st.sidebar.button("Entrar"):
+        user_id = authenticate(username, password)
+        if user_id:
+            st.session_state['user_id'] = user_id
+            st.success(f"Logado como {username}")
+        else:
+            st.error("Usuário ou senha inválidos")
+
+# ---------- Simulação ----------
+if 'user_id' in st.session_state:
+    st.subheader("💰 Simulação de Empréstimo PRONAMPE")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        loan = st.number_input("Valor do empréstimo (R$):", min_value=1000.0, step=1000.0, value=50000.0)
+        months = st.number_input("Prazo (meses):", min_value=1, step=1, value=12)
+        annual_rate = st.number_input("Taxa anual (%):", min_value=0.0, step=0.1, value=8.0)
+    
+    with col2:
+        iof = st.number_input("IOF (%):", min_value=0.0, step=0.01, value=0.38)
+        tarifas = st.number_input("Tarifas administrativas (R$):", min_value=0.0, step=1.0, value=100.0)
+        margem_risco = st.number_input("Margem de risco (%):", min_value=0.0, step=0.1, value=1.0)
+        selic = st.number_input("Taxa SELIC (%):", min_value=0.0, step=0.1, value=13.75)
+    
+    if st.button("Calcular"):
+        sim_result = calculate_pronampe(loan, annual_rate, months, iof/100, tarifas, margem_risco, selic)
+        st.metric("Parcela mensal (R$)", sim_result["parcela_mensal"])
+        st.metric("Total a pagar (R$)", sim_result["total_parcelas"])
+        st.metric("IOF (R$)", sim_result["iof"])
+        st.metric("Taxa efetiva (%)", sim_result["taxa_efetiva"])
+        
+        # Salvar simulação
+        save_simulation(st.session_state['user_id'], {
+            "loan": loan,
+            "months": months,
+            "annual_rate": annual_rate,
+            "iof_pct": iof,
+            "tarifas": tarifas,
+            "margem_risco": margem_risco,
+            "selic": selic,
+            **sim_result
+        })
+        
+        # Export Excel
+        df = pd.DataFrame([{
+            "Parcela Mensal": sim_result["parcela_mensal"],
+            "Total": sim_result["total_parcelas"],
+            "IOF": sim_result["iof"],
+            "Taxa Efetiva": sim_result["taxa_efetiva"]
+        }])
+        excel_path = os.path.join(DATA_DIR, f"Simulacao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+        df.to_excel(excel_path, index=False)
+        st.download_button("📥 Baixar Excel", data=open(excel_path, "rb"), file_name=os.path.basename(excel_path))
+        
+        # Google Sheets
+        gs_json = st.text_area("Credenciais Google Sheets (JSON) opcional")
+        if gs_json:
+            try:
+                sheet_name = export_to_gsheets({**sim_result, "loan": loan}, gs_json)
+                st.success(f"Exportado para Google Sheets: {sheet_name}")
+            except Exception as e:
+                st.error(f"Erro Google Sheets: {e}")
+
+    # Histórico de simulações
+    st.subheader("📜 Histórico de Simulações")
+    simulations = get_user_simulations(st.session_state['user_id'])
+    for sim in simulations[:10]:
+        st.write(f"🕒 {sim['timestamp']} - Valor: R${sim.get('loan')} - Parcela: R${sim.get('parcela_mensal')}")
